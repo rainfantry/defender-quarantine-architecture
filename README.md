@@ -381,6 +381,57 @@ This VSS access was **not observed** in any RTP trace. MsMpEng appears to cross-
 
 **Defensive significance:** This reveals an additional verification step in the custom scan pipeline. VSS cross-referencing may provide temporal integrity checking — comparing the file's current state against a point-in-time snapshot to detect tampering.
 
+### Finding 16 — Handle Deferral Blocks Quarantine via SHARING_VIOLATION
+
+When a user-mode process holds a handle on a detected file with `FILE_SHARE_READ` only (no `FILE_SHARE_DELETE`), MsMpEng.exe's quarantine pipeline is blocked at the `CreateFile` stage. MsMpEng attempts multiple access patterns, all returning `SHARING_VIOLATION`:
+
+```
+Line 305: CreateFile → SHARING VIOLATION  (Desired Access: Read Attributes, Write Attributes, Delete)
+Line 306: CreateFile → SHARING VIOLATION  (Desired Access: Generic Read/Write, ShareMode: None)
+Line 339: CreateFile → SHARING VIOLATION  (Desired Access: Generic Read/Write, ShareMode: None)
+Line 348: CreateFile → SHARING VIOLATION  (Desired Access: Read Data, ShareMode: Write)
+Line 349: CreateFile → SHARING VIOLATION  (Desired Access: Read Data, ShareMode: Write, Impersonating: user)
+```
+
+MsMpEng cycles through **five distinct access patterns** including user impersonation before giving up. Meanwhile, read-only access continues to succeed — the custom scan scanner (MpCmdRun) can still read and detect the file, returning exit code 2 (threat found).
+
+**Defensive significance:** Handle deferral is a real defense mechanism (Finding 3), but this reveals the specific failure modes. A user-mode process can prevent SYSTEM quarantine of its own files by holding a restrictive handle. This is by design — legitimate applications should not have files ripped out from under them. However, it also means an attacker can create a detection record while preventing remediation.
+
+### Finding 17 — DRP Check Bypass via TOCTOU Timing
+
+The reparse point awareness defense (Finding 13) checks the staging directory BEFORE the junction exists. During handle-deferred quarantine, the DRP check fires while the handle blocks quarantine:
+
+```
+Line 124: FSCTL_GET_REPARSE_POINT → NOT REPARSE POINT  (during scan, before swap)
+Line 132: FSCTL_GET_REPARSE_POINT → NOT REPARSE POINT
+Line 146: FSCTL_GET_REPARSE_POINT → NOT REPARSE POINT
+Line 154: FSCTL_GET_REPARSE_POINT → NOT REPARSE POINT
+...
+(12+ DRP checks, ALL return NOT REPARSE POINT — junction not yet planted)
+```
+
+The DRP check result is consumed during the scan phase. When the junction is planted after handle release, the DRP check does **not re-fire**. This confirms that the DRP defense is vulnerable to its own TOCTOU: if the directory is normal at check-time but becomes a junction at quarantine-time, the check is bypassed.
+
+**Defensive significance:** The DRP check (Finding 13) is a verification-based defense, not an architectural one. It can be bypassed with correct timing — checking happens during investigation, not at the moment of `SetDispositionInformationFile`. This narrows the remaining defense to the identity gate (Finding 6) alone.
+
+### Finding 18 — Fail-and-Forget Quarantine Model
+
+When MsMpEng's quarantine fails with SHARING_VIOLATION, the quarantine action is **consumed, not deferred**. After five failed access attempts, MsMpEng abandons the quarantine entirely. No retry mechanism fires after the blocking handle is released.
+
+Empirical evidence: ProcMon monitoring for 90 seconds after handle release showed **zero** MsMpEng activity on the staging path. The detection record exists (exit code 2 confirmed threat), the junction is in place, the target is accessible — but MsMpEng never returns.
+
+```
+Timeline:
+  9:58:36.573  Last SHARING_VIOLATION (attempt 5 of 5)
+  9:58:37.177  Last MsMpEng activity on staging path (oplock + read)
+  9:58:37.2+   Handle released, junction planted (8.13ms swap)
+  9:58:37 - 10:00:07  90-second monitoring → ZERO activity
+```
+
+This is distinct from Finding 3 (handle-aware deferral). Finding 3 describes quarantine being **deferred** while handles are open. Finding 18 reveals that after explicit SHARING_VIOLATION failures, the quarantine is **abandoned** — the retry logic does not queue a re-attempt for when the handle is eventually released.
+
+**Defensive significance:** The fail-and-forget model prevents an attacker from using handle deferral to time a junction swap. However, it also means that detected threats may remain on disk indefinitely if quarantine fails — a potential gap in remediation completeness. The attacker's challenge shifts from "racing the retry" to "forcing a re-remediation attempt through an already-planted junction."
+
 ---
 
 ## 5. Primitive Analysis
@@ -395,7 +446,9 @@ This VSS access was **not observed** in any RTP trace. MsMpEng appears to cross-
 | Access time oracle | Confirmed | LastAccessTime modified on target files | Low |
 | Oplock disruption | Confirmed | SYSTEM breaks existing oplocks through junction | Low |
 | SYSTEM file delete (RTP) | Blocked | WdFilter uses FILE_OBJECT (junction-immune) + identity gate | N/A |
-| SYSTEM file delete (Custom Scan) | Blocked | SetDispositionInformationFile exists but DRP check + identity gate abort | N/A |
+| SYSTEM file delete (Custom Scan) | Blocked | SetDispositionInformationFile exists but identity gate aborts | N/A |
+| Handle-deferred quarantine bypass | Blocked | Fail-and-forget model — no retry after SHARING_VIOLATION | N/A |
+| DRP check bypass (TOCTOU timing) | **Confirmed** | DRP checks fire during scan, not at delete time — bypassable | Medium |
 | SYSTEM file write | Blocked | CfExecute uses FILE_OBJECT (junction-immune) | N/A |
 
 ### 5.2 Why the Dangerous Primitives Are Blocked
@@ -404,10 +457,9 @@ This VSS access was **not observed** in any RTP trace. MsMpEng appears to cross-
 1. The identity-based re-verification gate (Layer 2) aborts on File ID mismatch
 2. Even if the gate passed, WdFilter (Layer 1) deletes through FILE_OBJECT, not path
 
-**Delete (Custom Scan):** Two independent defenses prevent it:
-1. The reparse point awareness check (Finding 13) detects DRP attribute and aborts
-2. The identity-based re-verification gate provides a second abort condition
-Note: unlike RTP, the custom scan delete mechanism IS path-based (`SetDispositionInformationFile`), so junction bypass would be destructive if both defenses were circumvented.
+**Delete (Custom Scan):** One confirmed defense prevents it:
+1. The identity-based re-verification gate (Finding 6) provides an abort condition on File ID mismatch
+Note: The DRP check (Finding 13) has been confirmed bypassable via TOCTOU timing (Finding 17) — the check fires during scan, not at delete time. The identity gate is now the **sole remaining defense** against junction-redirected deletion in the custom scan pipeline. Unlike RTP (where the delete mechanism itself is junction-immune), custom scan's `SetDispositionInformationFile` IS path-based and WOULD follow junctions if the identity gate were bypassed.
 
 **Write:** CfExecute (Cloud Files data delivery) operates through FILE_OBJECT references. Path resolution never occurs during data delivery. The write happens at minifilter altitude ~180451, below both ProcMon (~385000) and WdFilter (~328010).
 
@@ -420,11 +472,13 @@ Attack Attempt              Defense Layer(s)                              Result
 ─────────────────────────   ───────────────────────────────────────────   ──────
 Regular file + junction     WdFilter FILE_OBJECT (junction-immune)        BLOCKED
 Cloud File + junction       FILE_OBJECT delete + identity gate            BLOCKED*
-Custom scan + junction      DRP attribute check + identity gate           BLOCKED**
+Custom scan + junction      Identity gate (DRP bypassed via TOCTOU)       BLOCKED**
+Handle-deferred + swap      Fail-and-forget (no retry after SHARING_VIOLATION)  BLOCKED***
 CfExecute write redirect    FILE_OBJECT (junction-immune)                 BLOCKED
 
 * Junction followed during verify, but FILE_OBJECT delete is immune
-** Junction followed, path-based delete EXISTS but DRP check + identity gate abort
+** DRP check bypassed (Finding 17), identity gate is SOLE remaining defense
+*** Detection exists, junction in place, but quarantine never retries (Finding 18)
 ```
 
 The custom scan pathway represents the narrowest defense margin. Unlike RTP (where the delete mechanism itself is junction-immune), custom scan's `SetDispositionInformationFile` IS path-based and WOULD follow junctions if the reparse point awareness check and identity gate were both bypassed. The defense relies entirely on pre-delete verification rather than architectural immunity.
@@ -447,9 +501,11 @@ The custom scan pathway represents the narrowest defense margin. Unlike RTP (whe
 
 1. **The Cloud Files path is the attack surface.** Regular file quarantine is junction-immune. Research should focus on mechanisms that force path-based operations in Defender's pipeline — Cloud Files placeholders, virtual disk mounts, or any filesystem mechanism that prevents FILE_OBJECT caching.
 
-2. **Identity checks are the critical gate.** File ID is immutable per-file. Bypassing the re-verification gate requires either finding a code path that skips identity checks or finding a way to influence NTFS File ID assignment (neither observed in this research).
+2. **Identity checks are the LAST gate.** As of v9, the DRP check is confirmed bypassable via TOCTOU timing (Finding 17). File ID is immutable per-file. The identity gate (Finding 6) is now the sole defense preventing junction-redirected deletion in custom scan quarantine. Bypassing it requires either finding a code path that skips identity checks, finding a way to influence NTFS File ID assignment, or finding a trigger that forces re-remediation without identity verification (none observed in this research).
 
-3. **Custom scan quarantine is the weakest architecture.** As of v8b, custom scan quarantine is confirmed to use path-based `SetDispositionInformationFile` — unlike RTP which is architecturally junction-immune via FILE_OBJECT. The custom scan delete is protected by reparse point awareness (Finding 13) and identity verification (Finding 6), but these are verification-based defenses, not architectural ones. Scheduled scans and different detection types (PUA, behavioral, script-based) may share the custom scan pipeline or use yet another mechanism. These remain untested.
+3. **Custom scan quarantine is the weakest architecture.** Custom scan quarantine uses path-based `SetDispositionInformationFile` — unlike RTP which is architecturally junction-immune via FILE_OBJECT. The DRP check is bypassable (Finding 17). The fail-and-forget model (Finding 18) prevents handle-deferred timing attacks. The remaining attack surface is: find a mechanism to trigger quarantine on a stored detection record through a junction path, bypassing or satisfying the identity gate. Vectors to test: forced re-remediation via MpCmdRun/PowerShell, scheduled scan re-processing of unresolved detections, different detection types (PUA, behavioral, script-based) that may share the pipeline but skip identity verification.
+
+4. **The fail-and-forget model has a remediation gap.** Finding 18 shows MsMpEng abandons quarantine after SHARING_VIOLATION without scheduling a retry. Detected threats may persist on disk. This is worth investigating from a defensive completeness perspective — does Defender's periodic maintenance eventually re-process these detections?
 
 ### 6.3 For Microsoft
 
@@ -471,7 +527,9 @@ This research was disclosed to MSRC as a defense-in-depth finding. Specific reco
 | 2026-06-13 | Junction traversal confirmed. SYSTEM read primitive verified. |
 | 2026-06-14 | Dual-layer architecture fully mapped. RTP DELETE/WRITE primitives confirmed dead. |
 | 2026-06-14 | v8b: Custom scan quarantine discovered to use path-based SetDispositionInformationFile. Three distinct quarantine architectures documented. Reparse point awareness defense identified. |
-| 2026-06-14 | MSRC disclosure prepared (defense-in-depth finding: SYSTEM junction traversal with read primitive, path-based delete in custom scan mitigated by DRP check). |
+| 2026-06-14 | v8c-fix: Handle deferral confirmed — FILE_SHARE_READ blocks quarantine with SHARING_VIOLATION. DRP check bypass via TOCTOU timing confirmed (Finding 17). |
+| 2026-06-14 | v9: Full handle-deferred custom scan test. MsMpEng hit 5 SHARING_VIOLATIONs, abandoned quarantine permanently. Fail-and-forget model documented (Finding 18). |
+| 2026-06-14 | MSRC disclosure prepared (defense-in-depth finding: SYSTEM junction traversal with read primitive, path-based delete in custom scan, DRP bypass confirmed, identity gate is sole remaining defense). |
 
 **Disclosure policy:** This research follows coordinated disclosure practices. Architecture documentation is published for defensive purposes. No exploit code is included in this repository.
 
