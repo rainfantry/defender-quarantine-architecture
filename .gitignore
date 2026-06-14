@@ -1,0 +1,11 @@
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.csv
+*.log
+.vs/
