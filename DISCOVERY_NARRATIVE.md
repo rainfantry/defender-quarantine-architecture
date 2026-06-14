@@ -151,6 +151,48 @@ The 481-event ProcMon trace revealed the complete picture:
 
 ---
 
+---
+
+## Phase 4: Custom Scan — A Different Pipeline (v8b)
+
+### v8b — Custom Scan Quarantine Mechanism Probe
+
+**Hypothesis:** Custom scans triggered via `MpCmdRun.exe -Scan -ScanType 3` may use a different quarantine pipeline than RTP. If the pipeline is path-based, the delete may be junction-exploitable.
+
+**Design:** Two engagements. Engagement 1: baseline custom scan of EICAR (no junction) — look for `SetDispositionInformationFile`. Engagement 2: custom scan through junction — look for delete on target path.
+
+**Result (Engagement 1):** `SetDispositionInformationFile` appears at line 383 of the ProcMon trace.
+
+```
+Line 383: MsMpEng.exe  SetDispositionInformationFile  bait.exe  SUCCESS  Delete: True
+```
+
+This operation has **never** appeared in any RTP trace (0 in 481+ events). Custom scan quarantine uses a path-based delete from MsMpEng.exe user-mode code. This is fundamentally different from RTP's WdFilter FILE_OBJECT delete.
+
+**Additional observations from Engagement 1:**
+- 12 `FSCTL_GET_REPARSE_POINT` checks throughout the quarantine burst — active reparse point scanning on the parent directory (all returned `NOT REPARSE POINT`)
+- Volume Shadow Copy access: MsMpEng reads from `\Device\HarddiskVolumeShadowCopy1\` during quarantine — cross-referencing file's historical state
+- 28ms window between last reparse point check and `SetDispositionInformationFile`
+
+**Result (Engagement 2 — junction present):** Junction traversal confirmed. REPARSE → SUCCESS. MsMpEng reads 68 bytes from target through junction (SYSTEM read primitive). Full metadata investigation including two `QueryIdInformation` cycles. But quarantine **ABORTED** — zero `SetDispositionInformationFile` in the entire engagement.
+
+**Discovery (Finding #17 — Custom Scan Path-Based Delete):** Custom scan quarantine uses `SetDispositionInformationFile` from MsMpEng.exe — a path-based delete that WOULD follow junctions if it fired. Three distinct quarantine architectures now identified:
+
+1. **RTP (regular files):** WdFilter FILE_OBJECT delete — junction-immune by design
+2. **RTP (Cloud Files):** MsMpEng verify-only (path-based) + WdFilter FILE_OBJECT delete — verify follows junctions but delete doesn't
+3. **Custom scan:** MsMpEng `SetDispositionInformationFile` — path-based delete, mitigated by reparse point awareness and identity gate
+
+**Discovery (Finding #18 — Reparse Point Awareness):** MsMpEng explicitly opens directories with `Open Reparse Point` flag and checks for `DRP` (Directory + Reparse Point) in `FileAttributes`. When detected, quarantine runs its full investigation but aborts before issuing the delete. This is a **separate defense** from the identity gate — junction-specific detection.
+
+```
+Line 406: CreateFile  vader_jnx  → SUCCESS  (Options: Open Reparse Point)
+Line 407: QueryNetworkOpenInfo   → FileAttributes: DRP
+```
+
+**Discovery (Finding #19 — VSS Cross-Reference):** Custom scan reads from Volume Shadow Copy during quarantine (not observed in RTP). Provides temporal integrity checking.
+
+---
+
 ## Summary of Defensive Layers Discovered
 
 | Layer | Mechanism | What It Blocks | Discovered In |
@@ -162,5 +204,9 @@ The 481-event ProcMon trace revealed the complete picture:
 | Identity re-verification | MsMpEng File ID + USN check | Content-matching junction attacks | v8a |
 | Kernel-layer delete | WdFilter FILE_OBJECT delete | Path-based delete even if re-verification passed | v8a |
 | CfExecute FILE_OBJECT | cldflt.sys cached references | Write-primitive via hydration redirect | v7b |
+| Reparse point awareness | MsMpEng DRP attribute check | Junction-redirected custom scan delete | v8b |
+| VSS cross-reference | MsMpEng VSS snapshot comparison | File tampering between scan and quarantine | v8b |
 
-Each layer was discovered by building an attack that bypassed all previously known layers and observing what stopped it next. The cumulative result is a seven-layer defense-in-depth architecture that blocks all tested destructive primitives while leaving a narrow read-primitive channel open.
+Each layer was discovered by building an attack that bypassed all previously known layers and observing what stopped it next. The cumulative result is a **nine-layer** defense-in-depth architecture that blocks all tested destructive primitives while leaving a narrow read-primitive channel open.
+
+**Note on the custom scan pathway:** The custom scan quarantine is the only architecture where the delete mechanism itself (SetDispositionInformationFile) is path-based. The reparse point awareness check and identity gate prevent junction-redirected deletion, but these are verification-based defenses rather than architectural ones. This makes the custom scan pathway the narrowest defense margin in the system.

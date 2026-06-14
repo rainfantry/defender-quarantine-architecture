@@ -125,19 +125,57 @@ The file is currently open by another process (or another MsMpEng thread) with r
 
 ---
 
-## What's Missing: SetDispositionInformationFile
+## SetDispositionInformationFile — The Path-Based Delete
 
-The most significant observation is what does NOT appear:
+### RTP Quarantine
 
-**Zero `SetDispositionInformationFile` operations in the entire 481-event trace.**
+**Zero `SetDispositionInformationFile` operations in 481+ RTP events analyzed.**
 
-`SetDispositionInformationFile` is the Win32 API path to file deletion. If MsMpEng.exe were performing the quarantine delete itself, this operation would appear. Its absence proves that:
+This absence is the key evidence for the dual-layer architecture: the component that follows junctions (MsMpEng) never deletes, and the component that deletes (WdFilter) never follows junctions.
 
-1. MsMpEng.exe's path-based pipeline is purely investigative
-2. The actual delete is performed by a different component (WdFilter.sys)
-3. WdFilter.sys operates through cached FILE_OBJECT references, not through the path namespace
+### Custom Scan Quarantine
 
-This is the key evidence for the dual-layer architecture: the component that follows junctions (MsMpEng) never deletes, and the component that deletes (WdFilter) never follows junctions.
+**`SetDispositionInformationFile` IS present in custom scan quarantine.**
+
+```
+SetDispositionInformationFile    C:\...\bait.exe    SUCCESS    Delete: True
+```
+
+This is MsMpEng.exe (user-mode, PID visible in ProcMon) issuing a path-based delete. This operation is preceded by:
+
+1. `CreateFile` with Delete access (Desired Access includes Delete)
+2. `QueryIdInformation` — identity verification gate
+3. `SetBasicInformationFile` — attribute reset (clears read-only, etc.)
+4. `SetDispositionInformationFile` — the actual delete
+
+After `SetDispositionInformationFile`, subsequent `CreateFile` calls return `DELETE PENDING`.
+
+This proves the custom scan pipeline uses a **different delete mechanism** than RTP. The path-based delete would follow NTFS junctions if executed on a junction-resolved path, but the reparse point awareness check (below) prevents this.
+
+## FSCTL_GET_REPARSE_POINT — Reparse Point Scanning
+
+```
+FSCTL_GET_REPARSE_POINT    C:\...\directory    NOT REPARSE POINT
+```
+
+Observed in custom scan quarantine only. MsMpEng.exe issues `FSCTL_GET_REPARSE_POINT` on the **parent directory** of the target file, repeatedly throughout the quarantine burst (12 instances observed in a single engagement).
+
+When the directory IS a junction/reparse point, MsMpEng instead uses `Open Reparse Point` flag in `CreateFile` and reads `FileAttributes`:
+
+```
+CreateFile    C:\...\junction_dir    SUCCESS    (Options: Open Reparse Point)
+QueryNetworkOpenInformationFile    FileAttributes: DRP
+```
+
+`DRP` = Directory + Reparse Point. Detection of this attribute correlates with quarantine abort (no `SetDispositionInformationFile` fires).
+
+## Volume Shadow Copy Access
+
+```
+CreateFile    \Device\HarddiskVolumeShadowCopy1\...\bait.exe    SUCCESS
+```
+
+Observed in custom scan quarantine only (not in RTP traces). MsMpEng reads files from the Volume Shadow Copy Service during quarantine. This provides temporal integrity checking — comparing the file's current state against a historical snapshot.
 
 ---
 

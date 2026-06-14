@@ -101,7 +101,7 @@ Each test engagement followed a controlled experiment structure:
 4. **Analysis** — Parse ProcMon CSV for specific IRP operations
 5. **Finding** — Document observed behavior with evidence
 
-The research progressed through 16 iterative experiments (v1 through v8b), each building on the findings of the previous one.
+The research progressed through 17 iterative experiments (v1 through v8b), each building on the findings of the previous one.
 
 ### 2.4 EICAR Test Standard
 
@@ -129,11 +129,13 @@ The most significant finding of this research is that Windows Defender's quarant
 │  │  • Reads content at resolved path                         │  │
 │  │  • Identity checks: File ID + USN comparison              │  │
 │  │  • FOLLOWS NTFS junctions (REPARSE → SUCCESS)             │  │
-│  │  • Purely investigative — never issues delete             │  │
+│  │  • RTP: purely investigative — never issues delete         │  │
+│  │  • Custom Scan: issues SetDispositionInformationFile       │  │
+│  │  •   (path-based delete, guarded by DRP check)            │  │
 │  │  • Some operations impersonate triggering user            │  │
 │  └───────────────────────┬────────────────────────────────────┘  │
-│                          │ identity match?                       │
-│                          │ YES → signal WdFilter                 │
+│                          │ identity match + no DRP?              │
+│                          │ YES → delete (custom) / signal (RTP)  │
 │                          │ NO  → ABORT (no quarantine)           │
 │  ┌───────────────────────▼────────────────────────────────────┐  │
 │  │  LAYER 1 — WdFilter.sys (Kernel minifilter, ring 0)       │  │
@@ -149,7 +151,9 @@ The most significant finding of this research is that Windows Defender's quarant
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Key insight:** The layer that follows junctions (Layer 2) never deletes. The layer that deletes (Layer 1) never follows junctions. This architectural separation is a robust defense-in-depth mechanism, likely by design.
+**Key insight (RTP):** The layer that follows junctions (Layer 2) never deletes. The layer that deletes (Layer 1) never follows junctions. This architectural separation is a robust defense-in-depth mechanism, likely by design.
+
+**Key insight (Custom Scan):** Layer 2 both follows junctions AND can issue deletes (`SetDispositionInformationFile`). However, a reparse point awareness check (Finding 13) detects junctions and aborts before the delete fires. The defense here is verification-based rather than architectural.
 
 ### 3.2 Detection vs. Remediation Decoupling
 
@@ -313,6 +317,70 @@ For Cloud Files placeholders, the gap between scan completion and quarantine sta
 
 **Defensive significance:** The gap is large enough that TOCTOU junction swaps are not a "race" but a "walk." Any defense relying on the swap being too slow to execute is ineffective.
 
+### Finding 12 — Custom Scan Uses Path-Based Delete
+
+Custom scans triggered via `MpCmdRun.exe -Scan -ScanType 3 -File <path>` use a fundamentally different quarantine mechanism than Real-Time Protection. The custom scan pipeline issues `SetDispositionInformationFile` directly from MsMpEng.exe — a **path-based delete** from user-mode code.
+
+This operation was observed at ProcMon line 383 of a 505-event trace (custom scan quarantine of a baseline file with no junction):
+
+```
+"MsMpEng.exe","SetDispositionInformationFile","...\bait.exe","SUCCESS","Delete: True"
+```
+
+In contrast, RTP quarantine shows **zero** `SetDispositionInformationFile` across 481+ analyzed events. RTP deletes exclusively through WdFilter.sys cached FILE_OBJECT references.
+
+**Three distinct quarantine architectures identified:**
+
+| Scan Type | Delete Mechanism | Path Operations? | Junction-Vulnerable? |
+|-----------|-----------------|-------------------|---------------------|
+| RTP (regular files) | WdFilter FILE_OBJECT | None | No (immune) |
+| RTP (Cloud Files) | WdFilter after MsMpEng verify | Verify only | Verify follows junction, delete doesn't |
+| Custom scan | MsMpEng SetDispositionInformationFile | **Full pipeline + delete** | Delete is path-based (mitigated by Findings 13-14) |
+
+**Defensive significance:** The custom scan pathway has a wider attack surface than RTP. A standard user can trigger custom scans via `MpCmdRun.exe` without administrator privileges. The path-based delete is architecturally capable of following junction redirects, though additional defenses (Findings 13, 14) currently prevent this.
+
+### Finding 13 — Reparse Point Awareness in Custom Scan
+
+During custom scan quarantine, MsMpEng.exe explicitly opens directories with the `Open Reparse Point` flag and checks `FileAttributes` for the `DRP` (Directory + Reparse Point) flag. When a junction is detected:
+
+```
+Line 406: CreateFile vader_jnx  → SUCCESS (Options: Open Reparse Point)
+Line 407: QueryNetworkOpenInfo  → FileAttributes: DRP
+```
+
+MsMpEng performs this check **twice** per quarantine cycle. When `DRP` is detected, the quarantine pipeline completes its full investigation (content read, identity verification) but **does not fire** `SetDispositionInformationFile`. The delete is suppressed.
+
+This is a **separate defense** from the identity-based re-verification gate (Finding 6). Even if file identity matched, the DRP detection appears to independently abort the quarantine.
+
+**Defensive significance:** MsMpEng has explicit junction awareness in the custom scan path. The reparse point attribute check provides a second line of defense beyond file identity verification. This was not documented in prior research.
+
+### Finding 14 — SYSTEM Read Primitive via Custom Scan
+
+MsMpEng.exe (running as SYSTEM) reads file content through junctions during custom scan quarantine, even when the quarantine ultimately aborts:
+
+```
+Line 433: ReadFile vader_target\bait.exe → SUCCESS, Offset: 0, Length: 68
+Line 472: ReadFile vader_target\bait.exe → SUCCESS, Offset: 0, Length: 68
+```
+
+Two complete 68-byte reads (full EICAR content) occur through the junction-resolved path, at SYSTEM privilege level. This extends Finding 9 (SYSTEM read primitive discovered in Cloud Files quarantine) to the custom scan pathway.
+
+The custom scan read is 68 bytes versus 16 bytes observed in Cloud Files quarantine — MsMpEng reads the full file content in custom scan mode, not just the signature header.
+
+**Defensive significance:** The SYSTEM read primitive exists across both Cloud Files and custom scan quarantine pathways. A standard user can trigger either pathway to force SYSTEM-privileged file reads through user-controlled junctions. The custom scan pathway is particularly accessible since it requires only `MpCmdRun.exe` (no Cloud Files registration).
+
+### Finding 15 — Volume Shadow Copy Access in Custom Scan
+
+During custom scan quarantine, MsMpEng.exe reads files from `\Device\HarddiskVolumeShadowCopy1\` — the Volume Shadow Copy Service:
+
+```
+Line 311: CreateFile \Device\HarddiskVolumeShadowCopy1\...\bait.exe → SUCCESS
+```
+
+This VSS access was **not observed** in any RTP trace. MsMpEng appears to cross-reference the file's historical state (VSS snapshot) against its current state during custom scan quarantine.
+
+**Defensive significance:** This reveals an additional verification step in the custom scan pipeline. VSS cross-referencing may provide temporal integrity checking — comparing the file's current state against a point-in-time snapshot to detect tampering.
+
 ---
 
 ## 5. Primitive Analysis
@@ -321,36 +389,45 @@ For Cloud Files placeholders, the gap between scan completion and quarantine sta
 
 | Primitive | Status | Mechanism | Severity |
 |-----------|--------|-----------|----------|
-| SYSTEM file read | Confirmed | MsMpEng reads through junction during re-verification | Medium |
+| SYSTEM file read (Cloud Files) | Confirmed | MsMpEng reads 16 bytes through junction during re-verification | Medium |
+| SYSTEM file read (Custom Scan) | Confirmed | MsMpEng reads 68 bytes (full content) through junction | Medium |
 | SYSTEM FSCTL operations | Confirmed | Oplock requests, USN queries through junction | Low |
 | Access time oracle | Confirmed | LastAccessTime modified on target files | Low |
 | Oplock disruption | Confirmed | SYSTEM breaks existing oplocks through junction | Low |
-| SYSTEM file delete | Blocked | WdFilter uses FILE_OBJECT (junction-immune) + identity gate | N/A |
+| SYSTEM file delete (RTP) | Blocked | WdFilter uses FILE_OBJECT (junction-immune) + identity gate | N/A |
+| SYSTEM file delete (Custom Scan) | Blocked | SetDispositionInformationFile exists but DRP check + identity gate abort | N/A |
 | SYSTEM file write | Blocked | CfExecute uses FILE_OBJECT (junction-immune) | N/A |
 
 ### 5.2 Why the Dangerous Primitives Are Blocked
 
-**Delete:** Two independent layers prevent it:
+**Delete (RTP):** Two independent layers prevent it:
 1. The identity-based re-verification gate (Layer 2) aborts on File ID mismatch
 2. Even if the gate passed, WdFilter (Layer 1) deletes through FILE_OBJECT, not path
+
+**Delete (Custom Scan):** Two independent defenses prevent it:
+1. The reparse point awareness check (Finding 13) detects DRP attribute and aborts
+2. The identity-based re-verification gate provides a second abort condition
+Note: unlike RTP, the custom scan delete mechanism IS path-based (`SetDispositionInformationFile`), so junction bypass would be destructive if both defenses were circumvented.
 
 **Write:** CfExecute (Cloud Files data delivery) operates through FILE_OBJECT references. Path resolution never occurs during data delivery. The write happens at minifilter altitude ~180451, below both ProcMon (~385000) and WdFilter (~328010).
 
 ### 5.3 Defense-in-Depth Assessment
 
-The quarantine pipeline implements effective defense-in-depth:
+The quarantine pipeline implements effective defense-in-depth across three distinct architectures:
 
 ```
-Attack Attempt              Layer 1 (WdFilter)    Layer 2 (MsMpEng)    Result
-─────────────────────────   ──────────────────    ─────────────────    ──────
-Regular file + junction     FILE_OBJECT (immune)  Not triggered        BLOCKED
-Cloud File + junction       FILE_OBJECT (immune)  Path-based (follows) BLOCKED*
-CfExecute write redirect    N/A                   FILE_OBJECT (immune) BLOCKED
+Attack Attempt              Defense Layer(s)                              Result
+─────────────────────────   ───────────────────────────────────────────   ──────
+Regular file + junction     WdFilter FILE_OBJECT (junction-immune)        BLOCKED
+Cloud File + junction       FILE_OBJECT delete + identity gate            BLOCKED*
+Custom scan + junction      DRP attribute check + identity gate           BLOCKED**
+CfExecute write redirect    FILE_OBJECT (junction-immune)                 BLOCKED
 
-* Junction followed but identity gate aborts before destructive action
+* Junction followed during verify, but FILE_OBJECT delete is immune
+** Junction followed, path-based delete EXISTS but DRP check + identity gate abort
 ```
 
-No single layer provides complete protection, but the combination of junction-immune FILE_OBJECT operations (Layer 1) and identity-based re-verification (Layer 2) blocks all tested destructive primitives.
+The custom scan pathway represents the narrowest defense margin. Unlike RTP (where the delete mechanism itself is junction-immune), custom scan's `SetDispositionInformationFile` IS path-based and WOULD follow junctions if the reparse point awareness check and identity gate were both bypassed. The defense relies entirely on pre-delete verification rather than architectural immunity.
 
 ---
 
@@ -372,7 +449,7 @@ No single layer provides complete protection, but the combination of junction-im
 
 2. **Identity checks are the critical gate.** File ID is immutable per-file. Bypassing the re-verification gate requires either finding a code path that skips identity checks or finding a way to influence NTFS File ID assignment (neither observed in this research).
 
-3. **Different scan types may use different pipelines.** This research focused on Real-Time Protection (RTP). Custom scans (`MpCmdRun.exe -Scan -ScanType 3`), scheduled scans, and different detection types (PUA, behavioral, script-based) may use different quarantine mechanisms. These remain untested vectors.
+3. **Custom scan quarantine is the weakest architecture.** As of v8b, custom scan quarantine is confirmed to use path-based `SetDispositionInformationFile` — unlike RTP which is architecturally junction-immune via FILE_OBJECT. The custom scan delete is protected by reparse point awareness (Finding 13) and identity verification (Finding 6), but these are verification-based defenses, not architectural ones. Scheduled scans and different detection types (PUA, behavioral, script-based) may share the custom scan pipeline or use yet another mechanism. These remain untested.
 
 ### 6.3 For Microsoft
 
@@ -392,8 +469,9 @@ This research was disclosed to MSRC as a defense-in-depth finding. Specific reco
 |------|--------|
 | 2026-06-13 | Research initiated. Cloud Files path-based quarantine discovered. |
 | 2026-06-13 | Junction traversal confirmed. SYSTEM read primitive verified. |
-| 2026-06-14 | Dual-layer architecture fully mapped. DELETE/WRITE primitives confirmed dead. |
-| 2026-06-14 | MSRC disclosure prepared (defense-in-depth finding: SYSTEM junction traversal with read primitive). |
+| 2026-06-14 | Dual-layer architecture fully mapped. RTP DELETE/WRITE primitives confirmed dead. |
+| 2026-06-14 | v8b: Custom scan quarantine discovered to use path-based SetDispositionInformationFile. Three distinct quarantine architectures documented. Reparse point awareness defense identified. |
+| 2026-06-14 | MSRC disclosure prepared (defense-in-depth finding: SYSTEM junction traversal with read primitive, path-based delete in custom scan mitigated by DRP check). |
 
 **Disclosure policy:** This research follows coordinated disclosure practices. Architecture documentation is published for defensive purposes. No exploit code is included in this repository.
 
