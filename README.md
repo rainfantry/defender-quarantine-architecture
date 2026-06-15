@@ -26,7 +26,8 @@ The goal is defensive: to help security professionals, system administrators, an
 5. [Primitive Analysis](#5-primitive-analysis)
 6. [Defensive Recommendations](#6-defensive-recommendations)
 7. [Responsible Disclosure](#7-responsible-disclosure)
-8. [References](#8-references)
+8. [Forward Application](#8-forward-application-what-the-architecture-taught-us)
+9. [References](#9-references)
 
 ---
 
@@ -535,7 +536,52 @@ This research was disclosed to MSRC as a defense-in-depth finding. Specific reco
 
 ---
 
-## 8. References
+## 8. Forward Application: What the Architecture Taught Us
+
+This research produced zero exploitable privilege escalation against WdFilter's quarantine pipeline. That's the point. A thorough negative result has its own value — it maps the defense surface precisely enough to inform where to look next.
+
+### 8.1 Why WdFilter Held
+
+The dual-layer architecture (kernel FILE_OBJECT caching + user-mode identity gate) is genuinely robust against junction-based TOCTOU. Key lessons:
+
+- **FILE_OBJECT caching makes junctions invisible at quarantine time** (Finding 4). The kernel already has a handle to the real file. The junction is a path-layer redirect; WdFilter operates at the object layer. Architecture, not patches.
+- **Identity gate uses NTFS File ID** (Finding 6). Immutable per-file. Not spoofable via junctions, not affected by renames, not dependent on path resolution. The gate is a single comparison, and it's architecturally correct.
+- **CfExecute is also FILE_OBJECT-based** (Finding 8). Even the Cloud Files path, which forces path-based quarantine, still performs the critical operations through cached handles.
+
+### 8.2 Where the Seams Are
+
+What the research DID reveal about the broader minifilter ecosystem:
+
+- **cldflt.sys (altitude 180451) sits below WdFilter (altitude 328010) in the minifilter stack.** Operations that WdFilter scrutinises never reach cldflt in the same inspection pass. This altitude gap means Cloud Files operations interact with the kernel at a layer WdFilter doesn't monitor during quarantine.
+- **The CfAbortHydration callback path** (observed during Cloud Files placeholder interactions) involves token impersonation during kernel-mode callbacks. This is the race surface that MiniPlasma demonstrated — not against WdFilter, but against cldflt itself.
+- **The 5-second quarantine gap** (Finding 11) demonstrates that even well-defended pipelines have timing windows. The gap's irrelevance to WdFilter (identity gate catches everything) doesn't mean it's irrelevant to other minifilters in the stack.
+
+### 8.3 Minifilter Altitude Stack (Observed)
+
+```
+                   ALTITUDE
+ProcMon      ~385,000   (observation layer)
+WdFilter      328,010   (Defender real-time protection)
+bindflt       409,800   (Bind Filter — AppX VFS)
+cldflt        180,451   (Cloud Files Mini-Filter)
+NTFS          100,000   (filesystem)
+```
+
+The research on WdFilter's architecture directly informed the pivot to cldflt/bindflt research. The quarantine pipeline is hardened. The minifilter stack beneath it is less studied.
+
+### 8.4 Research Continuity
+
+| Phase | Focus | Outcome |
+|-------|-------|---------|
+| **vader-toctou** (this research) | WdFilter quarantine architecture | 18 findings. Wall held. Architecture mapped. |
+| **Rootkit phase** | Service ACLs, PATH injection, Defender telemetry | 22+ findings. SYSTEM achieved (third-party). CVE submissions prepared. |
+| **VADER-PRIME** | cldflt race + novel payload chains | Framework compiled. Untested. Depends on race viability on current build. |
+
+The quarantine architecture research is the foundation. Every subsequent finding was informed by understanding where WdFilter looks — and where it doesn't.
+
+---
+
+## 9. References
 
 - [CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition](https://cwe.mitre.org/data/definitions/367.html)
 - [EICAR Anti-Malware Test File](https://www.eicar.org/download-anti-malware-testfile/)
@@ -550,9 +596,11 @@ This research was disclosed to MSRC as a defense-in-depth finding. Specific reco
 ## Author
 
 **George Wu** — Independent security researcher, Sydney, Australia.
-Cybersecurity student. GitHub: [rainfantry](https://github.com/rainfantry).
+Cybersecurity student (CSEC). Callsign: VADER. GitHub: [rainfantry](https://github.com/rainfantry).
 
-This research was conducted as part of academic cybersecurity coursework on personally-owned hardware. No unauthorized systems were accessed or targeted.
+Portfolio: [rainfantry.github.io](https://rainfantry.github.io)
+
+This research was conducted as part of academic cybersecurity coursework on personally-owned hardware. No unauthorized systems were accessed or targeted. Responsible disclosure via MSRC for all Microsoft-actionable findings.
 
 ---
 
