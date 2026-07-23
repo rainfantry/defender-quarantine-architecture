@@ -596,7 +596,7 @@ The quarantine architecture research is the foundation. Every subsequent finding
 ## Author
 
 **George Wu** — Independent security researcher, Sydney, Australia.
-Cybersecurity student (CSEC). Callsign: VADER. GitHub: [rainfantry](https://github.com/rainfantry).
+Cybersecurity student (CSEC).  GitHub: [rainfantry](https://github.com/rainfantry).
 
 Portfolio: [rainfantry.github.io](https://rainfantry.github.io)
 
